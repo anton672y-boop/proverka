@@ -1,0 +1,639 @@
+Flask==3.0.0
+Flask-SQLAlchemy==3.1.1
+Werkzeug==3.0.1
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+import os
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-change-me'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+
+
+# ==================== МОДЕЛИ ====================
+
+class Track(db.Model):
+    """Музыкальный трек с клипом"""
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    artist = db.Column(db.String(200), nullable=False)
+    genre = db.Column(db.String(100), default='Другое')
+    description = db.Column(db.Text, default='')
+    # Ссылки (YouTube embed / VK / прямые ссылки)
+    music_url = db.Column(db.String(500), default='')  # аудио
+    clip_url = db.Column(db.String(500), default='')   # видео-клип
+    cover_url = db.Column(db.String(500), default='')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    ratings = db.relationship('Rating', backref='track', lazy=True, cascade='all, delete-orphan')
+
+    @property
+    def avg_rating(self):
+        if not self.ratings:
+            return 0
+        return round(sum(r.score for r in self.ratings) / len(self.ratings), 1)
+
+    @property
+    def rating_count(self):
+        return len(self.ratings)
+
+
+class Rating(db.Model):
+    """Оценка трека"""
+    id = db.Column(db.Integer, primary_key=True)
+    track_id = db.Column(db.Integer, db.ForeignKey('track.id'), nullable=False)
+    score = db.Column(db.Integer, nullable=False)  # 1-10
+    comment = db.Column(db.Text, default='')
+    author = db.Column(db.String(100), default='Аноним')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+# ==================== РОУТЫ ====================
+
+def embed_url(url: str) -> str:
+    """Преобразует обычную ссылку YouTube в embed"""
+    if not url:
+        return ''
+    if 'youtube.com/watch?v=' in url:
+        vid = url.split('v=')[1].split('&')[0]
+        return f'https://www.youtube.com/embed/{vid}'
+    if 'youtu.be/' in url:
+        vid = url.split('youtu.be/')[1].split('?')[0]
+        return f'https://www.youtube.com/embed/{vid}'
+    return url
+
+
+@app.route('/')
+def index():
+    """Главная — список всех треков с клипами и оценками"""
+    sort = request.args.get('sort', 'new')
+    genre = request.args.get('genre', '')
+
+    query = Track.query
+    if genre:
+        query = query.filter_by(genre=genre)
+
+    tracks = query.all()
+
+    if sort == 'rating':
+        tracks.sort(key=lambda t: t.avg_rating, reverse=True)
+    elif sort == 'title':
+        tracks.sort(key=lambda t: t.title.lower())
+    else:  # new
+        tracks.sort(key=lambda t: t.created_at, reverse=True)
+
+    genres = sorted({t.genre for t in Track.query.all()})
+
+    return render_template('index.html', tracks=tracks, genres=genres,
+                           current_sort=sort, current_genre=genre,
+                           embed_url=embed_url)
+
+
+@app.route('/track/<int:track_id>')
+def track_detail(track_id):
+    """Страница отдельного трека"""
+    track = Track.query.get_or_404(track_id)
+    return render_template('track.html', track=track, embed_url=embed_url)
+
+
+@app.route('/add', methods=['GET', 'POST'])
+def add_track():
+    """Добавить трек с клипом"""
+    if request.method == 'POST':
+        track = Track(
+            title=request.form['title'].strip(),
+            artist=request.form['artist'].strip(),
+            genre=request.form.get('genre', 'Другое').strip() or 'Другое',
+            description=request.form.get('description', '').strip(),
+            music_url=request.form.get('music_url', '').strip(),
+            clip_url=request.form.get('clip_url', '').strip(),
+            cover_url=request.form.get('cover_url', '').strip(),
+        )
+        if not track.title or not track.artist:
+            flash('Название и исполнитель обязательны!', 'error')
+            return redirect(url_for('add_track'))
+
+        db.session.add(track)
+        db.session.commit()
+        flash('Трек добавлен!', 'success')
+        return redirect(url_for('index'))
+
+    return render_template('add.html')
+
+
+@app.route('/rate/<int:track_id>', methods=['POST'])
+def rate(track_id):
+    """Оценить трек"""
+    track = Track.query.get_or_404(track_id)
+    try:
+        score = int(request.form['score'])
+    except (KeyError, ValueError):
+        flash('Некорректная оценка', 'error')
+        return redirect(url_for('track_detail', track_id=track_id))
+
+    if not 1 <= score <= 10:
+        flash('Оценка должна быть от 1 до 10', 'error')
+        return redirect(url_for('track_detail', track_id=track_id))
+
+    rating = Rating(
+        track_id=track.id,
+        score=score,
+        comment=request.form.get('comment', '').strip(),
+        author=request.form.get('author', '').strip() or 'Аноним',
+    )
+    db.session.add(rating)
+    db.session.commit()
+    flash('Спасибо за оценку!', 'success')
+    return redirect(url_for('track_detail', track_id=track_id))
+
+
+@app.route('/delete/<int:track_id>', methods=['POST'])
+def delete_track(track_id):
+    """Удалить трек"""
+    track = Track.query.get_or_404(track_id)
+    db.session.delete(track)
+    db.session.commit()
+    flash('Трек удалён', 'success')
+    return redirect(url_for('index'))
+
+
+# ==================== API ====================
+
+@app.route('/api/tracks')
+def api_tracks():
+    """JSON-API со всеми треками"""
+    tracks = Track.query.all()
+    return jsonify([{
+        'id': t.id,
+        'title': t.title,
+        'artist': t.artist,
+        'genre': t.genre,
+        'avg_rating': t.avg_rating,
+        'rating_count': t.rating_count,
+        'clip_url': t.clip_url,
+        'music_url': t.music_url,
+    } for t in tracks])
+
+
+with app.app_context():
+    db.create_all()
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}MusicRate{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header>
+        <nav class="navbar">
+            <a href="{{ url_for('index') }}" class="logo">🎵 MusicRate</a>
+            <div class="nav-links">
+                <a href="{{ url_for('index') }}">Главная</a>
+                <a href="{{ url_for('add_track') }}" class="btn btn-primary">+ Добавить</a>
+            </div>
+        </nav>
+    </header>
+
+    <main>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flash-container">
+                    {% for category, msg in messages %}
+                        <div class="flash flash-{{ category }}">{{ msg }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer>
+        <p>🎵 MusicRate — оценивай музыку и клипы</p>
+    </footer>
+</body>
+</html>
+{% extends "base.html" %}
+{% block title %}Главная — MusicRate{% endblock %}
+
+{% block content %}
+<section class="hero">
+    <h1>Оценивай <span>музыку</span> и <span>клипы</span></h1>
+    <p>Смотри клипы под каждой композицией и ставь оценки от 1 до 10</p>
+</section>
+
+<div class="controls">
+    <div class="filters">
+        <a href="{{ url_for('index', sort='new', genre=current_genre) }}"
+           class="chip {{ 'active' if current_sort == 'new' }}">🆕 Новые</a>
+        <a href="{{ url_for('index', sort='rating', genre=current_genre) }}"
+           class="chip {{ 'active' if current_sort == 'rating' }}">⭐ По рейтингу</a>
+        <a href="{{ url_for('index', sort='title', genre=current_genre) }}"
+           class="chip {{ 'active' if current_sort == 'title' }}">🔤 По названию</a>
+    </div>
+    <div class="filters">
+        <a href="{{ url_for('index', sort=current_sort) }}"
+           class="chip {{ 'active' if not current_genre }}">Все жанры</a>
+        {% for g in genres %}
+            <a href="{{ url_for('index', sort=current_sort, genre=g) }}"
+               class="chip {{ 'active' if current_genre == g }}">{{ g }}</a>
+        {% endfor %}
+    </div>
+</div>
+
+{% if tracks %}
+    <div class="tracks">
+        {% for t in tracks %}
+        <article class="track-card">
+            <div class="track-header">
+                <div>
+                    <h2>{{ t.title }}</h2>
+                    <p class="artist">{{ t.artist }} · <span class="genre">{{ t.genre }}</span></p>
+                </div>
+                <div class="rating-badge">
+                    ⭐ {{ t.avg_rating }}<span class="count">({{ t.rating_count }})</span>
+                </div>
+            </div>
+
+            {% if t.description %}
+                <p class="desc">{{ t.description }}</p>
+            {% endif %}
+
+            <!-- 🎬 КЛИП ПОД МУЗЫКОЙ -->
+            {% if t.clip_url %}
+            <div class="clip-block">
+                <h3>🎬 Клип</h3>
+                <div class="video-wrap">
+                    <iframe src="{{ embed_url(t.clip_url) }}"
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                            allowfullscreen loading="lazy"></iframe>
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- 🎧 МУЗЫКА -->
+            {% if t.music_url %}
+            <div class="music-block">
+                <h3>🎧 Аудио</h3>
+                <audio controls preload="none" src="{{ t.music_url }}"></audio>
+            </div>
+            {% endif %}
+
+            <div class="actions">
+                <a href="{{ url_for('track_detail', track_id=t.id) }}" class="btn">Оценить / Подробнее</a>
+                <form action="{{ url_for('delete_track', track_id=t.id) }}" method="post"
+                      onsubmit="return confirm('Удалить трек?')">
+                    <button type="submit" class="btn btn-danger">Удалить</button>
+                </form>
+            </div>
+        </article>
+        {% endfor %}
+    </div>
+{% else %}
+    <div class="empty">
+        <p>Пока нет треков 😢</p>
+        <a href="{{ url_for('add_track') }}" class="btn btn-primary">Добавить первый трек</a>
+    </div>
+{% endif %}
+{% endblock %}
+{% extends "base.html" %}
+{% block title %}{{ track.title }} — MusicRate{% endblock %}
+
+{% block content %}
+<a href="{{ url_for('index') }}" class="back-link">← Назад</a>
+
+<article class="track-detail">
+    <header class="track-header">
+        <div>
+            <h1>{{ track.title }}</h1>
+            <p class="artist">{{ track.artist }} · <span class="genre">{{ track.genre }}</span></p>
+        </div>
+        <div class="rating-badge big">
+            ⭐ {{ track.avg_rating }}<span class="count">({{ track.rating_count }} оценок)</span>
+        </div>
+    </header>
+
+    {% if track.description %}
+        <p class="desc">{{ track.description }}</p>
+    {% endif %}
+
+    <!-- 🎬 КЛИП -->
+    {% if track.clip_url %}
+    <section class="clip-block">
+        <h2>🎬 Клип</h2>
+        <div class="video-wrap">
+            <iframe src="{{ embed_url(track.clip_url) }}"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                    allowfullscreen></iframe>
+        </div>
+    </section>
+    {% endif %}
+
+    <!-- 🎧 МУЗЫКА -->
+    {% if track.music_url %}
+    <section class="music-block">
+        <h2>🎧 Аудио</h2>
+        <audio controls src="{{ track.music_url }}" style="width:100%"></audio>
+    </section>
+    {% endif %}
+
+    <!-- ФОРМА ОЦЕНКИ -->
+    <section class="rate-form">
+        <h2>Поставь оценку</h2>
+        <form action="{{ url_for('rate', track_id=track.id) }}" method="post">
+            <div class="stars">
+                {% for i in range(1, 11) %}
+                    <label class="star">
+                        <input type="radio" name="score" value="{{ i }}" required>
+                        <span>{{ i }}</span>
+                    </label>
+                {% endfor %}
+            </div>
+            <input type="text" name="author" placeholder="Ваше имя (необязательно)">
+            <textarea name="comment" rows="3" placeholder="Комментарий (необязательно)"></textarea>
+            <button type="submit" class="btn btn-primary">Отправить оценку</button>
+        </form>
+    </section>
+
+    <!-- ОТЗЫВЫ -->
+    <section class="reviews">
+        <h2>Отзывы ({{ track.ratings|length }})</h2>
+        {% for r in track.ratings|sort(attribute='created_at', reverse=True) %}
+        <div class="review">
+            <div class="review-head">
+                <strong>{{ r.author }}</strong>
+                <span class="score">⭐ {{ r.score }}/10</span>
+            </div>
+            {% if r.comment %}<p>{{ r.comment }}</p>{% endif %}
+            <small>{{ r.created_at.strftime('%d.%m.%Y %H:%M') }}</small>
+        </div>
+        {% else %}
+            <p>Пока нет отзывов — будь первым!</p>
+        {% endfor %}
+    </section>
+</article>
+{% endblock %}
+{% extends "base.html" %}
+{% block title %}Добавить трек{% endblock %}
+
+{% block content %}
+<h1>Добавить трек с клипом</h1>
+<form method="post" class="form">
+    <label>Название* <input type="text" name="title" required></label>
+    <label>Исполнитель* <input type="text" name="artist" required></label>
+    <label>Жанр
+        <select name="genre">
+            <option>Поп</option>
+            <option>Рок</option>
+            <option>Хип-хоп</option>
+            <option>Электронная</option>
+            <option>Джаз</option>
+            <option>Классика</option>
+            <option>Другое</option>
+        </select>
+    </label>
+    <label>Описание <textarea name="description" rows="3"></textarea></label>
+    <label>Ссылка на клип (YouTube)
+        <input type="url" name="clip_url" placeholder="https://youtube.com/watch?v=...">
+    </label>
+    <label>Ссылка на аудио (mp3)
+        <input type="url" name="music_url" placeholder="https://example.com/song.mp3">
+    </label>
+    <button type="submit" class="btn btn-primary">Добавить</button>
+</form>
+{% endblock %}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+    --primary: #8b5cf6;
+    --primary-dark: #7c3aed;
+    --dark: #1e1b2e;
+    --light: #f5f3ff;
+    --gray: #6b7280;
+    --card: #ffffff;
+}
+
+body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--light);
+    color: var(--dark);
+    line-height: 1.6;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+main { flex: 1; max-width: 1000px; margin: 0 auto; padding: 2rem 1rem; width: 100%; }
+
+/* Навигация */
+.navbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 2rem;
+    background: white;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+.logo { font-weight: 800; font-size: 1.4rem; color: var(--primary); text-decoration: none; }
+.nav-links { display: flex; gap: 1rem; align-items: center; }
+.nav-links a { text-decoration: none; color: var(--dark); font-weight: 500; }
+
+/* Герой */
+.hero {
+    text-align: center;
+    padding: 3rem 1rem;
+    background: linear-gradient(135deg, #ede9fe, #f5f3ff);
+    border-radius: 24px;
+    margin-bottom: 2rem;
+}
+.hero h1 { font-size: clamp(1.8rem, 4vw, 2.6rem); margin-bottom: .5rem; }
+.hero h1 span { color: var(--primary); }
+.hero p { color: var(--gray); }
+
+/* Кнопки */
+.btn {
+    display: inline-block;
+    padding: .6rem 1.2rem;
+    border-radius: 10px;
+    border: none;
+    background: white;
+    color: var(--dark);
+    text-decoration: none;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .2s;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+.btn:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(0,0,0,0.1); }
+.btn-primary { background: var(--primary); color: white; }
+.btn-primary:hover { background: var(--primary-dark); }
+.btn-danger { background: #fee2e2; color: #dc2626; }
+
+/* Фильтры */
+.controls { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 2rem; }
+.filters { display: flex; flex-wrap: wrap; gap: .5rem; }
+.chip {
+    padding: .4rem .9rem;
+    border-radius: 20px;
+    background: white;
+    text-decoration: none;
+    color: var(--dark);
+    font-size: .9rem;
+    transition: all .2s;
+    border: 1px solid #e5e7eb;
+}
+.chip.active { background: var(--primary); color: white; border-color: var(--primary); }
+
+/* Карточки треков */
+.tracks { display: grid; gap: 2rem; }
+.track-card {
+    background: var(--card);
+    border-radius: 20px;
+    padding: 1.5rem;
+    box-shadow: 0 4px 20px rgba(139,92,246,0.08);
+    transition: box-shadow .2s;
+}
+.track-card:hover { box-shadow: 0 8px 30px rgba(139,92,246,0.15); }
+
+.track-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: .5rem;
+}
+.track-header h2, .track-header h1 { font-size: 1.4rem; }
+.artist { color: var(--gray); }
+.genre { background: #ede9fe; color: var(--primary-dark); padding: .1rem .5rem; border-radius: 6px; font-size: .85rem; }
+
+.rating-badge {
+    background: linear-gradient(135deg, #fbbf24, #f59e0b);
+    color: white;
+    padding: .4rem .9rem;
+    border-radius: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+.rating-badge.big { font-size: 1.3rem; padding: .7rem 1.2rem; }
+.rating-badge .count { font-size: .8rem; opacity: .8; margin-left: .3rem; }
+
+.desc { color: var(--gray); margin: .8rem 0; }
+
+/* 🎬 Клип — под музыкой */
+.clip-block, .music-block { margin: 1rem 0; }
+.clip-block h3, .music-block h3, .clip-block h2, .music-block h2 {
+    font-size: 1rem;
+    color: var(--gray);
+    margin-bottom: .5rem;
+    font-weight: 600;
+}
+.video-wrap {
+    position: relative;
+    padding-bottom: 56.25%;
+    height: 0;
+    overflow: hidden;
+    border-radius: 14px;
+    background: #000;
+}
+.video-wrap iframe {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    border: none;
+}
+audio { width: 100%; margin-top: .3rem; }
+
+.actions { display: flex; gap: .6rem; margin-top: 1rem; flex-wrap: wrap; }
+
+/* Формы */
+.form { display: grid; gap: 1rem; max-width: 600px; background: white; padding: 2rem; border-radius: 20px; }
+.form label { display: grid; gap: .3rem; font-weight: 600; }
+.form input, .form textarea, .form select {
+    padding: .7rem;
+    border: 2px solid #e5e7eb;
+    border-radius: 10px;
+    font-family: inherit;
+    font-size: 1rem;
+    transition: border .2s;
+}
+.form input:focus, .form textarea:focus, .form select:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+/* Оценка звёзд (числа) */
+.stars { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.star input { display: none; }
+.star span {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 10px;
+    background: #f3f4f6;
+    cursor: pointer;
+    font-weight: 700;
+    transition: all .2s;
+}
+.star input:checked + span { background: var(--primary); color: white; transform: scale(1.1); }
+.star span:hover { background: #ddd6fe; }
+
+.rate-form { background: white; padding: 1.5rem; border-radius: 20px; margin: 1.5rem 0; }
+.rate-form h2 { margin-bottom: 1rem; }
+.rate-form input, .rate-form textarea {
+    width: 100%;
+    padding: .7rem;
+    border: 2px solid #e5e7eb;
+    border-radius: 10px;
+    margin-bottom: .8rem;
+    font-family: inherit;
+}
+
+/* Отзывы */
+.reviews { background: white; padding: 1.5rem; border-radius: 20px; margin: 1.5rem 0; }
+.review { padding: 1rem 0; border-bottom: 1px solid #e5e7eb; }
+.review:last-child { border-bottom: none; }
+.review-head { display: flex; justify-content: space-between; margin-bottom: .3rem; }
+.review .score { color: #f59e0b; font-weight: 700; }
+.review small { color: var(--gray); font-size: .8rem; }
+
+/* Flash */
+.flash-container { margin-bottom: 1rem; }
+.flash {
+    padding: .8rem 1rem;
+    border-radius: 10px;
+    margin-bottom: .5rem;
+    background: #ecfdf5;
+    color: #059669;
+    border-left: 4px solid #10b981;
+}
+.flash-error { background: #fef2f2; color: #dc2626; border-left-color: #dc2626; }
+
+/* Пустое состояние */
+.empty { text-align: center; padding: 3rem; color: var(--gray); }
+.empty p { font-size: 1.2rem; margin-bottom: 1rem; }
+
+.back-link { display: inline-block; margin-bottom: 1rem; color: var(--primary); text-decoration: none; font-weight: 600; }
+
+footer { text-align: center; padding: 2rem; color: var(--gray); font-size: .9rem; }
+
+@media (max-width: 600px) {
+    .navbar { padding: 1rem; }
+    .track-card { padding: 1rem; }
+    .stars span { width: 36px; height: 36px; }
+}
